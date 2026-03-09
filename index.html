@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reactive Scorpion Cursor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+cursor: none;
+overflow: hidden;
+background: #000;
+width: 100vw;
+height: 100vh;
+}
+canvas {
+position: fixed;
+top: 0;
+left: 0;
+width: 100vw;
+height: 100vh;
+display: block;
+}
+</style>
+</head>
+<body>
+<canvas id="scorpionCanvas"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('scorpionCanvas');
+  const ctx = canvas.getContext('2d');
+
+  // --- Sizing ---
+  function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  // --- Mouse ---
+  const mouse = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+  let mouseSpeed = 0;
+  let prevMouse = { x: mouse.x, y: mouse.y };
+  let mouseStill = 0;
+  let mouseStillFrames = 0;
+
+  document.addEventListener('mousemove', e => {
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+  });
+
+  // --- Segment class ---
+  function createSegment(x, y, length, radius) {
+    return { x, y, angle: 0, length, radius: radius || 3 };
+  }
+
+  // --- Scorpion anatomy ---
+  // Body spine: 18 segments (head at 0, thorax 0-5, abdomen 6-17)
+  const BODY_COUNT = 18;
+  const TAIL_COUNT = 10;
+  const LEG_PAIRS = 6;
+
+  const bodySegments = [];
+  const tailSegments = [];
+
+  // Create body segments with varying radii
+  for (let i = 0; i < BODY_COUNT; i++) {
+    const t = i / (BODY_COUNT - 1);
+    let radius;
+    if (i < 3) {
+      // Head region - starts wide (pincers area)
+      radius = 5 + (i === 0 ? 2 : i === 1 ? 3 : 2);
+    } else if (i < 8) {
+      // Thorax - widest
+      radius = 7 + Math.sin((i - 3) / 5 * Math.PI) * 3;
+    } else {
+      // Abdomen - tapers
+      radius = 7 - ((i - 8) / (BODY_COUNT - 9)) * 4;
+    }
+    const len = i === 0 ? 0 : (i < 6 ? 10 : 9);
+    bodySegments.push(createSegment(canvas.width / 2, canvas.height / 2 + i * len, len, radius));
+  }
+
+  // Create tail segments - curves upward
+  for (let i = 0; i < TAIL_COUNT; i++) {
+    const len = 12 - i * 0.3;
+    const radius = 3 - (i / TAIL_COUNT) * 2;
+    tailSegments.push(createSegment(
+      bodySegments[BODY_COUNT - 1].x,
+      bodySegments[BODY_COUNT - 1].y + i * len,
+      len,
+      Math.max(radius, 0.8)
+    ));
+  }
+
+  // Leg structure: each leg has hip, knee, foot
+  const legs = [];
+  for (let i = 0; i < LEG_PAIRS; i++) {
+    for (let side = -1; side <= 1; side += 2) {
+      legs.push({
+        bodyIndex: 2 + i,   // attach to thorax segments
+        side,
+        hipLen: 14 + (i < 2 ? 6 : 0),
+        shinLen: 16 + (i < 2 ? 8 : 0),
+        footX: 0, footY: 0,
+        targetFootX: 0, targetFootY: 0,
+        grounded: true,
+        phase: i * 0.9 + (side === 1 ? Math.PI : 0),
+        stepTimer: 0,
+        isPincer: i === 0
+      });
+    }
+  }
+
+  // Pincer claws (first pair of legs)
+  const pincers = [legs[0], legs[1]];
+
+  // Initialize leg foot positions
+  legs.forEach(leg => {
+    const seg = bodySegments[leg.bodyIndex];
+    const perpAngle = seg.angle + Math.PI / 2;
+    const dist = (leg.hipLen + leg.shinLen) * 0.6;
+    leg.footX = seg.x + Math.cos(perpAngle) * dist * leg.side;
+    leg.footY = seg.y + Math.sin(perpAngle) * dist * leg.side;
+    leg.targetFootX = leg.footX;
+    leg.targetFootY = leg.footY;
+  });
+
+  // --- Time ---
+  let time = 0;
+  let tailStrikeTimer = 0;
+  let tailStriking = false;
+
+  // --- IK follow function ---
+  function followTarget(seg, targetX, targetY) {
+    const dx = targetX - seg.x;
+    const dy = targetY - seg.y;
+    seg.angle = Math.atan2(dy, dx);
+    seg.x = targetX - Math.cos(seg.angle) * seg.length;
+    seg.y = targetY - Math.sin(seg.angle) * seg.length;
+  }
+
+  // --- 2-bone IK for legs ---
+  function solveLegIK(startX, startY, endX, endY, len1, len2, side) {
+    const dx = endX - startX;
+    const dy = endY - startY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const maxDist = len1 + len2;
+
+    let clampedDist = Math.min(dist, maxDist * 0.99);
+    if (clampedDist < Math.abs(len1 - len2) + 0.1) {
+      clampedDist = Math.abs(len1 - len2) + 0.1;
+    }
+
+    const angle = Math.atan2(dy, dx);
+
+    // Law of cosines
+    const cosKnee = (len1 * len1 + len2 * len2 - clampedDist * clampedDist) / (2 * len1 * len2);
+    const cosHip = (len1 * len1 + clampedDist * clampedDist - len2 * len2) / (2 * len1 * clampedDist);
+
+    const clampedCosKnee = Math.max(-1, Math.min(1, cosKnee));
+    const clampedCosHip = Math.max(-1, Math.min(1, cosHip));
+
+    const kneeAngle = Math.acos(clampedCosKnee);
+    const hipAngle = Math.acos(clampedCosHip);
+
+    const a1 = angle + hipAngle * side;
+
+    const kneeX = startX + Math.cos(a1) * len1;
+    const kneeY = startY + Math.sin(a1) * len1;
+
+    return { kneeX, kneeY, footX: endX, footY: endY };
+  }
+
+  // --- Update ---
+  function updateScorpion() {
+    // Mouse speed
+    const mdx = mouse.x - prevMouse.x;
+    const mdy = mouse.y - prevMouse.y;
+    mouseSpeed = Math.sqrt(mdx * mdx + mdy * mdy);
+    prevMouse.x = mouse.x;
+    prevMouse.y = mouse.y;
+
+    if (mouseSpeed < 1) {
+      mouseStillFrames++;
+    } else {
+      mouseStillFrames = 0;
+    }
+
+    // Speed-based lerp factor
+    const baseLerp = 0.08;
+    const speedBoost = Math.min(mouseSpeed * 0.003, 0.12);
+    const lerp = baseLerp + speedBoost;
+
+    // Head follows mouse with lerp
+    const head = bodySegments[0];
+    head.x += (mouse.x - head.x) * lerp;
+    head.y += (mouse.y - head.y) * lerp;
+    head.angle = Math.atan2(mouse.y - head.y, mouse.x - head.x);
+
+    // Body segments follow using IK
+    for (let i = 1; i < BODY_COUNT; i++) {
+      const prev = bodySegments[i - 1];
+      const seg = bodySegments[i];
+
+      // Add subtle sway
+      const sway = Math.sin(time * 3 + i * 0.5) * 0.03 * (mouseSpeed > 2 ? 1 : 0.2);
+
+      const dx = prev.x - seg.x;
+      const dy = prev.y - seg.y;
+      let angle = Math.atan2(dy, dx) + sway;
+
+      seg.angle = angle;
+      seg.x = prev.x - Math.cos(angle) * seg.length;
+      seg.y = prev.y - Math.sin(angle) * seg.length;
+    }
+
+    // Tail follows last body segment
+    const tailBase = bodySegments[BODY_COUNT - 1];
+    const bodyAngle = tailBase.angle;
+
+    // Tail strike detection
+    if (mouseStillFrames > 90 && !tailStriking) {
+      tailStriking = true;
+      tailStrikeTimer = 0;
+    }
+    if (tailStriking) {
+      tailStrikeTimer += 0.08;
+      if (tailStrikeTimer > Math.PI) {
+        tailStriking = false;
+        tailStrikeTimer = 0;
+      }
+    }
+
+    for (let i = 0; i < TAIL_COUNT; i++) {
+      const prev = i === 0 ? tailBase : tailSegments[i - 1];
+      const seg = tailSegments[i];
+
+      const t = i / (TAIL_COUNT - 1);
+
+      // Tail curves upward and oscillates
+      let curlOffset = -0.25 * t; // curves opposite to body direction
+      let oscillation = Math.sin(time * 2.5 + i * 0.4) * 0.15 * (1 + t);
+
+      // Tail strike: whip forward toward cursor
+      if (tailStriking && i > TAIL_COUNT / 2) {
+        const strikeIntensity = Math.sin(tailStrikeTimer) * (t - 0.5) * 2.0;
+        const toMouseAngle = Math.atan2(mouse.y - seg.y, mouse.x - seg.x);
+        const bodyAngleNorm = prev.angle + Math.PI;
+        let angleDiff = toMouseAngle - bodyAngleNorm;
+        while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+        while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+        curlOffset += angleDiff * strikeIntensity * 0.3;
+      }
+
+      const dx = prev.x - seg.x;
+      const dy = prev.y - seg.y;
+      let angle = Math.atan2(dy, dx) + curlOffset + oscillation;
+
+      seg.angle = angle;
+      seg.x = prev.x - Math.cos(angle) * seg.length;
+      seg.y = prev.y - Math.sin(angle) * seg.length;
+    }
+
+    // --- Leg updates ---
+    const bodyVelX = bodySegments[0].x - (bodySegments[0]._prevX || bodySegments[0].x);
+    const bodyVelY = bodySegments[0].y - (bodySegments[0]._prevY || bodySegments[0].y);
+    const bodySpeed = Math.sqrt(bodyVelX * bodyVelX + bodyVelY * bodyVelY);
+
+    bodySegments.forEach(s => { s._prevX = s.x; s._prevY = s.y; });
+
+    legs.forEach((leg, idx) => {
+      const seg = bodySegments[leg.bodyIndex];
+      const perpAngle = seg.angle + Math.PI / 2;
+      const baseAngle = seg.angle;
+
+      // Hip attachment point
+      const hipX = seg.x + Math.cos(perpAngle) * 4 * leg.side;
+      const hipY = seg.y + Math.sin(perpAngle) * 4 * leg.side;
+
+      // Desired stride position
+      const strideLen = (leg.hipLen + leg.shinLen) * 0.55;
+      let walkCycle = Math.sin(time * 6 + leg.phase);
+
+      // Target foot position based on walking
+      const spreadAngle = perpAngle + Math.sin(time * 6 + leg.phase) * 0.3 * (bodySpeed > 0.5 ? 1 : 0.1);
+
+      // Pincers behavior
+      if (leg.isPincer) {
+        // Pincers extend forward and to the side
+        const pincerAngle = baseAngle + leg.side * 0.6 + Math.sin(time * 1.5 + leg.side) * 0.15;
+        const pincerDist = strideLen * 1.1;
+        leg.targetFootX = hipX + Math.cos(pincerAngle) * pincerDist;
+        leg.targetFootY = hipY + Math.sin(pincerAngle) * pincerDist;
+
+        // Pincers reach toward mouse when still
+        if (mouseStillFrames > 30) {
+          const toMouse = Math.atan2(mouse.y - hipY, mouse.x - hipX);
+          const reach = Math.min(strideLen * 1.2, Math.sqrt((mouse.x - hipX) ** 2 + (mouse.y - hipY) ** 2));
+          leg.targetFootX = hipX + Math.cos(toMouse) * reach * 0.5 + Math.cos(pincerAngle) * reach * 0.5;
+          leg.targetFootY = hipY + Math.sin(toMouse) * reach * 0.5 + Math.sin(pincerAngle) * reach * 0.5;
+        }
+      } else {
+        leg.targetFootX = hipX + Math.cos(spreadAngle) * strideLen;
+        leg.targetFootY = hipY + Math.sin(spreadAngle) * strideLen;
+
+        // Add forward/backward stride
+        if (bodySpeed > 0.5) {
+          const strideOffset = walkCycle * 8;
+          leg.targetFootX += Math.cos(baseAngle) * strideOffset;
+          leg.targetFootY += Math.sin(baseAngle) * strideOffset;
+        }
+      }
+
+      // Check if foot needs to step
+      const footDist = Math.sqrt(
+        (leg.footX - leg.targetFootX) ** 2 +
+        (leg.footY - leg.targetFootY) ** 2
+      );
+
+      const stepThreshold = leg.isPincer ? 25 : 20;
+
+      if (footDist > stepThreshold && leg.grounded) {
+        leg.grounded = false;
+        leg.stepTimer = 0;
+      }
+
+      if (!leg.grounded) {
+        leg.stepTimer += 0.15;
+        const stepT = Math.min(leg.stepTimer, 1);
+        const eased = stepT < 0.5
+          ? 2 * stepT * stepT
+          : 1 - Math.pow(-2 * stepT + 2, 2) / 2;
+
+        leg.footX += (leg.targetFootX - leg.footX) * eased;
+        leg.footY += (leg.targetFootY - leg.footY) * eased;
+
+        if (stepT >= 1) {
+          leg.grounded = true;
+        }
+      }
+
+      // Store hip position
+      leg.hipX = hipX;
+      leg.hipY = hipY;
+
+      // Solve IK
+      const ik = solveLegIK(
+        hipX, hipY,
+        leg.footX, leg.footY,
+        leg.hipLen, leg.shinLen,
+        leg.side
+      );
+      leg.kneeX = ik.kneeX;
+      leg.kneeY = ik.kneeY;
+    });
+
+    time += 0.016;
+  }
+
+  // --- Drawing ---
+  function drawScorpion() {
+    ctx.save();
+
+    // Glow
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = 'rgba(255, 255, 255, 0.5)';
+
+    // Draw legs first (behind body)
+    legs.forEach(leg => {
+      if (leg.isPincer) return; // draw pincers separately
+
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(leg.hipX, leg.hipY);
+      ctx.lineTo(leg.kneeX, leg.kneeY);
+      ctx.lineTo(leg.footX, leg.footY);
+      ctx.stroke();
+
+      // Joint dots
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+      ctx.beginPath();
+      ctx.arc(leg.kneeX, leg.kneeY, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Foot dot
+      ctx.beginPath();
+      ctx.arc(leg.footX, leg.footY, 1, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // Draw body spine with varying width
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = 'rgba(255, 255, 255, 0.6)';
+
+    // Body fill (organic shape)
+    ctx.fillStyle = 'rgba(30, 30, 30, 0.9)';
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.lineWidth = 1.2;
+
+    // Draw body as connected ellipses
+    for (let i = 0; i < BODY_COUNT; i++) {
+      const seg = bodySegments[i];
+      const r = seg.radius;
+
+      ctx.save();
+      ctx.translate(seg.x, seg.y);
+      ctx.rotate(seg.angle);
+
+      // Filled body segment
+      ctx.beginPath();
+      ctx.ellipse(0, 0, seg.length * 0.5 + 1, r, 0, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(20, 20, 20, 0.8)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    // Draw spine line
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(bodySegments[0].x, bodySegments[0].y);
+    for (let i = 1; i < BODY_COUNT; i++) {
+      ctx.lineTo(bodySegments[i].x, bodySegments[i].y);
+    }
+    ctx.stroke();
+
+    // Segment joints
+    for (let i = 0; i < BODY_COUNT; i++) {
+      const seg = bodySegments[i];
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+      ctx.beginPath();
+      ctx.arc(seg.x, seg.y, Math.max(seg.radius * 0.3, 1.5), 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // --- Draw head details ---
+    const head = bodySegments[0];
+    // Eyes
+    const eyeSpread = 3;
+    const eyeDist = 4;
+    const eyeAngle = head.angle;
+    for (let side = -1; side <= 1; side += 2) {
+      const ex = head.x + Math.cos(eyeAngle) * eyeDist + Math.cos(eyeAngle + Math.PI / 2) * eyeSpread * side;
+      const ey = head.y + Math.sin(eyeAngle) * eyeDist + Math.sin(eyeAngle + Math.PI / 2) * eyeSpread * side;
+
+      ctx.fillStyle = 'rgba(255, 100, 100, 0.9)';
+      ctx.shadowColor = 'rgba(255, 50, 50, 0.8)';
+      ctx.shadowBlur = 6;
+      ctx.beginPath();
+      ctx.arc(ex, ey, 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Mouth parts
+    ctx.shadowBlur = 4;
+    ctx.shadowColor = 'rgba(255, 255, 255, 0.4)';
+    for (let side = -1; side <= 1; side += 2) {
+      const mx = head.x + Math.cos(eyeAngle) * 7;
+      const my = head.y + Math.sin(eyeAngle) * 7;
+      const tipX = mx + Math.cos(eyeAngle + side * 0.4) * 4;
+      const tipY = my + Math.sin(eyeAngle + side * 0.4) * 4;
+
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(mx, my);
+      ctx.lineTo(tipX, tipY);
+      ctx.stroke();
+    }
+
+    // --- Draw pincers ---
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = 'rgba(255, 255, 255, 0.5)';
+    pincers.forEach(leg => {
+      // Arm
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.moveTo(leg.hipX, leg.hipY);
+      ctx.lineTo(leg.kneeX, leg.kneeY);
+      ctx.stroke();
+
+      // Forearm
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(leg.kneeX, leg.kneeY);
+      ctx.lineTo(leg.footX, leg.footY);
+      ctx.stroke();
+
+      // Claw at the end
+      const clawAngle = Math.atan2(leg.footY - leg.kneeY, leg.footX - leg.kneeX);
+      const clawLen = 8;
+      const clawOpen = 0.4 + Math.sin(time * 2) * 0.1;
+
+      const claw1X = leg.footX + Math.cos(clawAngle + clawOpen) * clawLen;
+      const claw1Y = leg.footY + Math.sin(clawAngle + clawOpen) * clawLen;
+      const claw2X = leg.footX + Math.cos(clawAngle - clawOpen) * clawLen;
+      const claw2Y = leg.footY + Math.sin(clawAngle - clawOpen) * clawLen;
+
+      ctx.lineWidth = 1.3;
+      ctx.beginPath();
+      ctx.moveTo(claw1X, claw1Y);
+      ctx.lineTo(leg.footX, leg.footY);
+      ctx.lineTo(claw2X, claw2Y);
+      ctx.stroke();
+
+      // Joint circles
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+      ctx.beginPath();
+      ctx.arc(leg.kneeX, leg.kneeY, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(leg.footX, leg.footY, 2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // --- Draw tail ---
+    ctx.shadowBlur = 6;
+    ctx.shadowColor = 'rgba(255, 255, 255, 0.4)';
+
+    // Tail body
+    const lastBody = bodySegments[BODY_COUNT - 1];
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(lastBody.x, lastBody.y);
+    for (let i = 0; i < TAIL_COUNT; i++) {
+      ctx.lineTo(tailSegments[i].x, tailSegments[i].y);
+    }
+    ctx.stroke();
+
+    // Tail segments
+    for (let i = 0; i < TAIL_COUNT; i++) {
+      const seg = tailSegments[i];
+      const t = i / (TAIL_COUNT - 1);
+      const r = seg.radius;
+
+      ctx.save();
+      ctx.translate(seg.x, seg.y);
+      ctx.rotate(seg.angle);
+
+      ctx.beginPath();
+      ctx.ellipse(0, 0, seg.length * 0.45, r + 1, 0, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(20, 20, 20, 0.7)';
+      ctx.fill();
+      ctx.strokeStyle = `rgba(255, 255, 255, ${0.4 + t * 0.3})`;
+      ctx.lineWidth = 0.7;
+      ctx.stroke();
+
+      ctx.restore();
+
+      // Joint dot
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+      ctx.beginPath();
+      ctx.arc(seg.x, seg.y, 1.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Stinger
+    const stinger = tailSegments[TAIL_COUNT - 1];
+    const stingerAngle = stinger.angle + Math.PI;
+    const stingerLen = 10;
+    const stingerTipX = stinger.x + Math.cos(stingerAngle) * stingerLen;
+    const stingerTipY = stinger.y + Math.sin(stingerAngle) * stingerLen;
+
+    // Stinger bulb
+    ctx.fillStyle = 'rgba(255, 200, 100, 0.6)';
+    ctx.shadowColor = 'rgba(255, 150, 50, 0.6)';
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.arc(stinger.x, stinger.y, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Stinger point
+    ctx.strokeStyle = 'rgba(255, 220, 150, 0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(stinger.x, stinger.y);
+    ctx.lineTo(stingerTipX, stingerTipY);
+    ctx.stroke();
+
+    // Stinger tip glow
+    ctx.fillStyle = 'rgba(255, 100, 50, 0.8)';
+    ctx.shadowColor = 'rgba(255, 50, 0, 0.8)';
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.arc(stingerTipX, stingerTipY, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  // --- Ambient particles ---
+  const particles = [];
+  for (let i = 0; i < 30; i++) {
+    particles.push({
+      x: Math.random() * canvas.width,
+      y: Math.random() * canvas.height,
+      vx: (Math.random() - 0.5) * 0.3,
+      vy: (Math.random() - 0.5) * 0.3,
+      size: Math.random() * 1.5 + 0.5,
+      alpha: Math.random() * 0.3
+    });
+  }
+
+  function drawParticles() {
+    particles.forEach(p => {
+      p.x += p.vx;
+      p.y += p.vy;
+      p.alpha = 0.1 + Math.sin(time * 2 + p.x * 0.01) * 0.1;
+
+      if (p.x < 0) p.x = canvas.width;
+      if (p.x > canvas.width) p.x = 0;
+      if (p.y < 0) p.y = canvas.height;
+      if (p.y > canvas.height) p.y = 0;
+
+      // Scatter from scorpion
+      const dx = p.x - bodySegments[0].x;
+      const dy = p.y - bodySegments[0].y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < 80) {
+        p.vx += dx / dist * 0.1;
+        p.vy += dy / dist * 0.1;
+      }
+
+      // Dampen
+      p.vx *= 0.99;
+      p.vy *= 0.99;
+
+      ctx.fillStyle = `rgba(255, 255, 255, ${p.alpha})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  // --- Subtle ground shadow ---
+  function drawShadow() {
+    ctx.save();
+    ctx.globalAlpha = 0.08;
+    ctx.fillStyle = 'white';
+
+    for (let i = 0; i < BODY_COUNT; i++) {
+      const seg = bodySegments[i];
+      ctx.beginPath();
+      ctx.ellipse(seg.x + 3, seg.y + 3, seg.radius * 1.2, seg.radius * 0.5, seg.angle, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // --- Cursor dot ---
+  function drawCursorTarget() {
+    const pulse = Math.sin(time * 4) * 0.3 + 0.7;
+    ctx.strokeStyle = `rgba(255, 255, 255, ${0.15 * pulse})`;
+    ctx.lineWidth = 0.5;
+
+    // Crosshair
+    const size = 6;
+    ctx.beginPath();
+    ctx.moveTo(mouse.x - size, mouse.y);
+    ctx.lineTo(mouse.x + size, mouse.y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(mouse.x, mouse.y - size);
+    ctx.lineTo(mouse.x, mouse.y + size);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(mouse.x, mouse.y, 3, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // --- Main loop ---
+  function animate() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Subtle vignette
+    const grad = ctx.createRadialGradient(
+      canvas.width / 2, canvas.height / 2, canvas.height * 0.3,
+      canvas.width / 2, canvas.height / 2, canvas.height * 0.8
+    );
+    grad.addColorStop(0, 'rgba(0, 0, 0, 0)');
+    grad.addColorStop(1, 'rgba(0, 0, 0, 0.4)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    drawParticles();
+    drawCursorTarget();
+
+    updateScorpion();
+    drawShadow();
+    drawScorpion();
+
+    requestAnimationFrame(animate);
+  }
+
+  animate();
+})();
+</script>
+</body>
+</html>
